@@ -14,22 +14,22 @@ module Data.TimerWheel
   , register_
   ) where
 
+import EntriesPSQ (Entries)
 import Entry (Entry(..), EntryId)
 import Supply (Supply)
 import Timestamp (Duration, Timestamp(Timestamp))
 
+import qualified EntriesPSQ as Entries
 import qualified Entry
 import qualified Supply
 import qualified Timestamp
 
 import Control.Concurrent
 import Control.Concurrent.STM
-import Control.DeepSeq
 import Control.Exception
 import Control.Monad
 import Data.Fixed (E6, E9, Fixed, div')
 import Data.Foldable
-import Data.List (partition)
 import Data.Vector (Vector)
 
 import qualified Data.Vector as Vector
@@ -93,13 +93,9 @@ data TimerWheel = TimerWheel
   { wheelEpoch :: !Timestamp
   , wheelAccuracy :: !Duration
   , wheelSupply :: !(Supply EntryId)
-  , wheelEntries :: !(Vector (TVar [Entry]))
+  , wheelEntries :: !(Vector (TVar Entries))
   , wheelThread :: !ThreadId
   }
-
-instance NFData TimerWheel where
-  rnf wheel =
-    wheel `seq` ()
 
 data Timer = Timer
   { reset :: IO Bool
@@ -117,8 +113,8 @@ new slots (realToFrac -> accuracy) = do
   epoch :: Timestamp <-
     Timestamp.now
 
-  wheel :: Vector (TVar [Entry]) <-
-    Vector.replicateM slots (newTVarIO [])
+  wheel :: Vector (TVar Entries) <-
+    Vector.replicateM slots (newTVarIO Entries.empty)
 
   reaperId :: ThreadId <-
     forkIO (reaper accuracy epoch wheel)
@@ -138,7 +134,7 @@ stop :: TimerWheel -> IO ()
 stop wheel =
   killThread (wheelThread wheel)
 
-reaper :: Duration -> Timestamp -> Vector (TVar [Entry]) -> IO ()
+reaper :: Duration -> Timestamp -> Vector (TVar Entries) -> IO ()
 reaper accuracy epoch wheel =
   loop 0
  where
@@ -147,11 +143,11 @@ reaper accuracy epoch wheel =
   loop i = do
     -- Sleep until the roughly the next bucket.
     threadDelay (Timestamp.micro accuracy)
-    print (Timestamp.micro accuracy)
+    -- print (Timestamp.micro accuracy)
 
     elapsed :: Timestamp <-
       Timestamp.since epoch
-    print elapsed
+    -- print elapsed
 
     -- Figure out which bucket we're in. Usually this will be 'i+1', but maybe
     -- we were scheduled a bit early and ended up in 'i', or maybe running the
@@ -178,30 +174,26 @@ reaper accuracy epoch wheel =
     print is
 
     for_ is $ \k -> do
-      let entriesVar :: TVar [Entry]
+      let entriesVar :: TVar Entries
           entriesVar =
             Vector.unsafeIndex wheel k
 
       join . atomically $ do
-        readTVar entriesVar >>= \case
-          [] ->
+        entries :: Entries <-
+          readTVar entriesVar
+
+        if Entries.null entries
+          then
             pure (pure ())
-
-          entries -> do
-            let expired, alive :: [Entry]
-                (expired, alive) =
-                  partition Entry.isExpired entries
-
-            writeTVar entriesVar $! map' Entry.decrement alive
+          else do
+            let (expired, alive) = Entries.squam entries
+            writeTVar entriesVar alive
 
             -- instance Monoid (IO ()) ;)
-            pure (for_ expired entryAction)
-              -- putStrLn (show (length entries))
-              -- foldMap (entryAction) expired)
-              -- foldMap (ignoreSyncException . entryAction) expired)
+            pure (foldMap ignoreSyncException expired)
     loop j
 
-entriesIn :: Duration -> TimerWheel -> IO (TVar [Entry])
+entriesIn :: Duration -> TimerWheel -> IO (TVar Entries)
 entriesIn delay TimerWheel{wheelAccuracy, wheelEpoch, wheelEntries} = do
   elapsed :: Duration <-
     Timestamp.since wheelEpoch
@@ -221,46 +213,46 @@ register (Timestamp -> delay) action wheel = do
           , entryAction = action
           }
 
-  entriesVar :: TVar [Entry] <-
+  entriesVar :: TVar Entries <-
     entriesIn delay wheel
 
-  atomically (modifyTVar' entriesVar (newEntry :))
+  atomically (modifyTVar' entriesVar (Entries.insert newEntry))
 
-  entriesVarVar :: TVar (TVar [Entry]) <-
+  entriesVarVar :: TVar (TVar Entries) <-
     newTVarIO entriesVar
 
   let reset :: IO Bool
       reset = do
-        newEntriesVar :: TVar [Entry] <-
+        newEntriesVar :: TVar Entries <-
           entriesIn delay wheel
 
         atomically $ do
-          oldEntriesVar :: TVar [Entry] <-
+          oldEntriesVar :: TVar Entries <-
             readTVar entriesVarVar
 
-          oldEntries :: [Entry] <-
+          oldEntries :: Entries <-
             readTVar oldEntriesVar
 
-          case Entry.delete newEntryId oldEntries of
+          case Entries.delete newEntryId oldEntries of
             (Nothing, _) ->
               pure False
 
             (Just entry, oldEntries') -> do
               writeTVar oldEntriesVar oldEntries'
-              modifyTVar' newEntriesVar (entry :)
+              modifyTVar' newEntriesVar (Entries.insert entry)
               writeTVar entriesVarVar newEntriesVar
               pure True
 
   let cancel :: IO Bool
       cancel =
         atomically $ do
-          oldEntriesVar :: TVar [Entry] <-
+          oldEntriesVar :: TVar Entries <-
             readTVar entriesVarVar
 
-          oldEntries :: [Entry] <-
+          oldEntries :: Entries <-
             readTVar oldEntriesVar
 
-          case Entry.delete newEntryId oldEntries of
+          case Entries.delete newEntryId oldEntries of
             (Nothing, _) ->
               pure False
             (_, oldEntries') -> do
@@ -287,10 +279,10 @@ register_ (realToFrac -> delay) action wheel = do
           , entryAction = action
           }
 
-  entriesVar :: TVar [Entry] <-
+  entriesVar :: TVar Entries <-
     entriesIn delay wheel
 
-  atomically (modifyTVar' entriesVar (newEntry :))
+  atomically (modifyTVar' entriesVar (Entries.insert newEntry))
 
 wheelEntryCount :: Duration -> TimerWheel -> Int
 wheelEntryCount delay TimerWheel{wheelAccuracy, wheelEntries} =
@@ -310,17 +302,6 @@ ignoreSyncException action =
 index :: Integer -> Vector a -> a
 index i v =
   Vector.unsafeIndex v (fromIntegral i `rem` Vector.length v)
-
-map' :: (a -> b) -> [a] -> [b]
-map' f = \case
-  [] ->
-    []
-
-  x:xs ->
-    let
-      !y = f x
-    in
-      y : map' f xs
 
 --------------------------------------------------------------------------------
 -- Debug functionality

@@ -22,7 +22,7 @@ main =
 
 timerWheelMain :: Int -> Int -> IO ()
 timerWheelMain n m = do
-  wheel <- TimerWheel.new (2^(16::Int)) (1/2)
+  wheel <- TimerWheel.new (2^(16::Int)) (1/10)
 
   done <- newEmptyMVar :: IO (MVar ())
 

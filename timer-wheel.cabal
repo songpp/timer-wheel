@@ -10,12 +10,14 @@ library
       atomic-primops
     , base
     , clock
-    , deepseq
+    , psqueues
     , stm
     , vector
   exposed-modules:
     Data.TimerWheel
   other-modules:
+    Entries
+    EntriesPSQ
     Entry
     Supply
     Timestamp
